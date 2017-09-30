@@ -1,59 +1,62 @@
-require 'date'
+require 'elasticsearch'
 require 'rest-client'
+require 'date'
+require 'yaml'
 require 'json'
 require 'csv'
 
-token = ''
-group_id = 0
-base_uri = "https://api.groupme.com/v3/groups/#{group_id}/messages"
+# load the config 
+config = YAML.load_file('config.yml')
+TOKEN = config['token']
+GROUP_ID = config['group_id']
+ES_HOST = config['es_host']
 
-# before_id
-# string — Returns messages created before the given message ID
-# since_id
-# string — Returns most recent messages created after the given message ID
-# after_id
-# string — Returns messages created immediately after the given message ID
-# limit
-# integer — Number of messages returned. Default is 20. Max is 100.
+# API setup
+BASE_URI = "https://api.groupme.com/v3"
+GROUP_MESSAGES = "/groups/#{GROUP_ID}/messages"
+GROUP_INFO = "/groups/#{GROUP_ID}"
 
+# message param defaults
 before_id = ''
 max = 100
+
+# es client
+client = Elasticsearch::Client.new host: ES_HOST
+
+data = []
+room_info = JSON.parse(RestClient.get BASE_URI + GROUP_INFO, {params: {access_token: TOKEN}})['response']
 
 CSV.open("kicks.csv", "wb") do |csv|
   headers = ['id', 'timestamp', 'event.type', 'adder_user', 'added_user', 'remover_user', 'removed_user', 'rejoined_user', 'raw']
   csv << headers
 
+  pages = room_info['messages']['count']/max
 
-  (0..100000).each do |i|
-    response = JSON.parse(RestClient.get base_uri, {
+  (0..pages).each do |i|
+    response = JSON.parse(RestClient.get BASE_URI + GROUP_MESSAGES, {
       params: {
-        access_token: token,
+        access_token: TOKEN,
         before_id: before_id,
-        max: max
+        limit: max
       }
     })['response']['messages']
 
     before_id = response.last['id']
 
     events = response.each { |e|
-      row = [e['id'], DateTime.strptime(e['created_at'].to_s, '%s').to_s]
-      if e['event']
-        row.push(e['event']['type'])
-        row.push((e['event']['data']['adder_user']['nickname'] rescue ''))
-        row.push((e['event']['data']['added_users'].map { |e| e['nickname'] }.join(' ') rescue ''))
-        row.push((e['event']['data']['remover_user']['nickname'] rescue ''))
-        row.push((e['event']['data']['removed_user']['nickname'] rescue ''))
-        row.push((e['event']['data']['user']['nickname'] rescue ''))
-        # if e['event']['type'] == 'membership.notifications.removed'
-        #   row.concat [e['event']['type'], e['event']['data']['remover_user']['nickname'], e['event']['data']['removed_user']['nickname']]
-        # elsif e['event']['type'] == 'membership.announce.added'
-        #   row.concat [e['event']['type'], e['event']['data']['adder_user']['nickname'], e['event']['data']['added_users'].first['nickname']]
-        # end
-      end
-      row.push(e)
-      csv << row
+      data.push e
+      # index the message. TODO: bulk insert
+      client.index index: "groupme_logs_#{GROUP_ID}", type: 'message', id: e['id'], body: e
     }
-
     p before_id
   end
 end
+
+# write data to files
+File.open("datadump_#{GROUP_ID}.json","w") do |f|
+  f.write(data.to_json)
+end
+File.open("roominfo_#{GROUP_ID}.json","w") do |f|
+  f.write(room_info.to_json)
+end
+
